@@ -130,7 +130,7 @@ for (gesdd, elty, relty) in ((:dgesdd_, :Float64, :Float64),
             m, n = size(A)
             minmn = min(m, n)
             if job == 'A'
-                if size(ws.U) != (m, n) || size(ws.VT) != (n, n)
+                if size(ws.U) != (m, m) || size(ws.VT) != (n, n)
                     if resize
                         resize!(ws, A, job = job)
                     else
@@ -161,6 +161,14 @@ for (gesdd, elty, relty) in ((:dgesdd_, :Float64, :Float64),
                         else
                             throw(ArgumentError("Workspace has wrong size, use resize!(ws, A, job = 'O')."))
                         end
+                    end
+                end
+            else # job == 'N': resize!(ws, A, job = 'N') makes U m×0 and VT n×0
+                if size(ws.U, 1) != m || size(ws.VT, 1) != n
+                    if resize
+                        resize!(ws, A, job = job)
+                    else
+                        throw(ArgumentError("Workspace has wrong size, use resize!(ws, A, job = 'N')."))
                     end
                 end
             end

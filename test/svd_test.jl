@@ -2,6 +2,9 @@ using Test
 using FastLapackInterface
 using LinearAlgebra.LAPACK
 
+# measured in a function, to avoid spurious allocations from the @test scope
+gesdd_allocations(ws, job, A) = @allocated LAPACK.gesdd!(ws, job, A)
+
 function test_sdd(m, n, numbertype)
     A1 = randn(numbertype, m, n)
     A2 = copy(A1)
@@ -38,6 +41,16 @@ function test_sdd(m, n, numbertype)
                 @test isapprox(VT2, A2)
             end
         end
+
+        # reusing ws for a larger matrix resizes it
+        A1 = randn(numbertype, m + 1, n + 2)
+        A2 = copy(A1)
+        U1, S1, VT1 = LAPACK.gesdd!(j, A1)
+        U2, S2, VT2 = LAPACK.gesdd!(ws, j, A2)
+        @test isapprox(S1, S2)
+
+        # a correctly sized ws is not resized again
+        @test gesdd_allocations(ws, j, randn(numbertype, m + 1, n + 2)) == 0
     end
 end
 
