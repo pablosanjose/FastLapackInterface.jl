@@ -1,4 +1,4 @@
-import LinearAlgebra.LAPACK: gees!, gges!
+import LinearAlgebra.LAPACK: gees!, gges!, tgsen!
 ## Schur and generalized Schur decomposition with reordering
 
 # SELECT functions
@@ -327,6 +327,7 @@ gees!(ws::SchurWs, jobvs::AbstractChar, A::AbstractMatrix; kwargs...)
 
 Workspace to be used with the [`LinearAlgebra.GeneralizedSchur`](https://docs.julialang.org/en/v1/stdlib/LinearAlgebra/#LinearAlgebra.GeneralizedSchur)
 representation of the Generalized Schur decomposition which uses the [`LAPACK.gges!`](@ref) function.
+Supports `Real` and `Complex` matrices.
 
 # Examples
 ```jldoctest
@@ -343,7 +344,7 @@ julia> B = [8.2 0.3
  1.7  4.3
 
 julia> ws = GeneralizedSchurWs(A)
-GeneralizedSchurWs{Float64}
+GeneralizedSchurWs{Float64, Float64}
   work: 90-element Vector{Float64}
   αr: 2-element Vector{Float64}
   αi: 2-element Vector{Float64}
@@ -382,16 +383,16 @@ Z factor:
  6.855578082442485
 ```
 """
-mutable struct GeneralizedSchurWs{T} <: Workspace
+mutable struct GeneralizedSchurWs{T, RT <: AbstractFloat} <: Workspace
     work::Vector{T}
     αr::Vector{T}
-    αi::Vector{T}
+    αi::Vector{RT}
     β::Vector{T}
     vsl::Matrix{T}
     vsr::Matrix{T}
     sdim::Ref{BlasInt}
     bwork::Vector{BlasInt}
-    eigen_values::Vector{Complex{T}}
+    eigen_values::Vector{Complex{RT}}
 end
 
 Base.length(ws::GeneralizedSchurWs) = length(ws.αr)
@@ -520,6 +521,94 @@ for (gges, elty) in ((:dgges_, :Float64),
     end
 end
 
+# Complex case: ws.αr holds α, and ws.αi is used as the real rwork array (length 8n)
+for (gges, elty, relty) in ((:zgges_, :ComplexF64, :Float64),
+    (:cgges_, :ComplexF32, :Float32))
+    @eval begin
+        function Base.resize!(ws::GeneralizedSchurWs, A::AbstractMatrix{$elty}; work = true)
+            chkstride1(A)
+            n = checksquare(A)
+            resize!(ws.αr, n)
+            resize!(ws.αi, 8n)
+            resize!(ws.β, n)
+            resize!(ws.bwork, n)
+            resize!(ws.eigen_values, n)
+            ws.vsl = zeros($elty, n, n)
+            ws.vsr = zeros($elty, n, n)
+            if work
+                info = Ref{BlasInt}()
+                ccall((@blasfunc($gges), liblapack), Cvoid,
+                    (Ref{UInt8}, Ref{UInt8}, Ref{UInt8}, Ptr{Cvoid},
+                        Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{$elty},
+                        Ref{BlasInt}, Ptr{Cvoid}, Ptr{$elty}, Ptr{$elty},
+                        Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt},
+                        Ptr{$elty}, Ref{BlasInt}, Ptr{$relty}, Ptr{Cvoid},
+                        Ref{BlasInt}, Clong, Clong, Clong),
+                    'V', 'V', 'N', C_NULL,
+                    n, A, max(1, stride(A, 2)), A,
+                    max(1, stride(A, 2)), C_NULL, ws.αr, ws.β,
+                    ws.vsl, n, ws.vsr, n,
+                    ws.work, -1, ws.αi, C_NULL,
+                    info, 1, 1, 1)
+
+                chklapackerror(info[])
+                resize!(ws.work, BlasInt(real(ws.work[1])))
+            end
+            return ws
+        end
+        GeneralizedSchurWs(A::AbstractMatrix{$elty}) = resize!(
+            GeneralizedSchurWs(Vector{$elty}(undef, 1), $elty[], $relty[], $elty[],
+                Matrix{$elty}(undef, 0, 0), Matrix{$elty}(undef, 0, 0),
+                Ref{BlasInt}(), BlasInt[], Complex{$relty}[]),
+            A)
+
+        function gges!(ws::GeneralizedSchurWs, jobvsl::AbstractChar,
+                jobvsr::AbstractChar,
+                A::AbstractMatrix{$elty}, B::AbstractMatrix{$elty};
+                select = nothing,
+                resize = true)
+            select === nothing ||
+                throw(ArgumentError("gges: eigenvalue selection is not supported for complex matrices"))
+            chkstride1(A, B)
+            n = checksquare(A)
+            m = checksquare(B)
+            if n != m
+                throw(DimensionMismatch("dimensions of A, ($n,$n), and B, ($m,$m), must match"))
+            end
+            nws = length(ws)
+            if n != nws
+                if resize
+                    resize!(ws, A; work = n > nws)
+                else
+                    throw(WorkspaceSizeError(nws, n))
+                end
+            end
+
+            info = Ref{BlasInt}()
+            ldvsl = size(ws.vsl, 1)
+            ldvsr = size(ws.vsr, 1)
+            ccall((@blasfunc($gges), liblapack), Cvoid,
+                (Ref{UInt8}, Ref{UInt8}, Ref{UInt8}, Ptr{Cvoid},
+                    Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{$elty},
+                    Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ptr{$elty},
+                    Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt},
+                    Ptr{$elty}, Ref{BlasInt}, Ptr{$relty}, Ptr{Cvoid},
+                    Ref{BlasInt}, Clong, Clong, Clong),
+                jobvsl, jobvsr, 'N', C_NULL,
+                n, A, max(1, stride(A, 2)), B,
+                max(1, stride(B, 2)), Ref{BlasInt}(), ws.αr, ws.β,
+                ws.vsl, ldvsl, ws.vsr, ldvsr,
+                ws.work, length(ws.work), ws.αi, C_NULL,
+                info, 1, 1, 1)
+            chklapackerror(info[])
+            @inbounds for i in axes(A, 1)
+                ws.eigen_values[i] = ws.αr[i] / ws.β[i]
+            end
+            return A, B, ws.αr, ws.β, ws.vsl, ws.vsr
+        end
+    end
+end
+
 """
     gges!(ws, jobvsl, jobvsr, A, B; select=nothing, criterium = 0, resize=true) -> (A, B, ws.α, ws.β, ws.vsl, ws.vsr)
 
@@ -537,6 +626,8 @@ It is possible to select the eigenvalues appearing in the top left corner of the
   and setting `criterium`.
 - by setting `select` equal to a function used to sort the eigenvalues during the decomposition. In this case, the `criterium` keyword isn't used. The function should have the signature `f(αr::T, αi::T, β::T) -> Bool` where `T == eltype(A)`. An eigenvalue `(αr[j]+αi[j])/β[j]` is selected if `f(αr[j],αi[j],β[j])` is true, i.e. if either one of a complex conjugate pair of eigenvalues is selected, then both complex eigenvalues are selected. This is not available on aarch64 architecture.
 
+For complex `A` and `B`, `select` is not supported, and `α` and `β` are both the complex workspace vectors `ws.αr` and `ws.β`.
+
 The generalized eigenvalues components are returned in `ws.α` and `ws.β` where `ws.α` is a complex vector and `ẁs.β`, a real vector.
 The generalized eigenvalues (`ws.α./ws.β`) are returned in `ws.eigen_values`, a complex vector. 
 The left Schur vectors are returned in `ws.vsl` and the right Schur vectors are returned in `ws.vsr`.
@@ -546,3 +637,233 @@ See also FastLapackInterface.SCHURORDER
 gges!(
     ws::GeneralizedSchurWs, jobvsl::AbstractChar, jobvsr::AbstractChar, A::AbstractMatrix,
     B::AbstractMatrix; kwargs...)
+
+"""
+    GeneralizedOrdSchurWs
+
+Workspace to reorder a generalized Schur decomposition, as
+[`LinearAlgebra.ordschur!`](https://docs.julialang.org/en/v1/stdlib/LinearAlgebra/#LinearAlgebra.ordschur!)
+does for a `GeneralizedSchur`, using the [`LAPACK.tgsen!`](@ref) function.
+Supports `Complex` matrices.
+
+# Examples
+```julia
+julia> A, B = randn(ComplexF64, 4, 4), randn(ComplexF64, 4, 4);
+
+julia> F = schur(A, B);
+
+julia> ws = GeneralizedOrdSchurWs(F.S);
+
+julia> select = LinearAlgebra.BlasInt[0, 0, 1, 1];  # move the last two eigenvalues to the top left
+
+julia> S, T, α, β, Q, Z = LAPACK.tgsen!(ws, select, F.S, F.T, F.Q, F.Z);
+```
+"""
+mutable struct GeneralizedOrdSchurWs{T <: Complex} <: Workspace
+    work::Vector{T}
+    iwork::Vector{BlasInt}
+    α::Vector{T}
+    β::Vector{T}
+end
+
+Base.length(ws::GeneralizedOrdSchurWs) = length(ws.α)
+
+for (tgsen, elty) in ((:ztgsen_, :ComplexF64),
+    (:ctgsen_, :ComplexF32))
+    @eval begin
+        function Base.resize!(ws::GeneralizedOrdSchurWs, A::AbstractMatrix{$elty}; work = true)
+            chkstride1(A)
+            n = checksquare(A)
+            resize!(ws.α, n)
+            resize!(ws.β, n)
+            if work
+                lda = max(1, stride(A, 2))
+                select = zeros(BlasInt, n)  # read by the workspace query
+                info = Ref{BlasInt}()
+                ccall((@blasfunc($tgsen), liblapack), Cvoid,
+                    (Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt}, Ptr{BlasInt},
+                        Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{$elty},
+                        Ref{BlasInt}, Ptr{$elty}, Ptr{$elty},
+                        Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt},
+                        Ref{BlasInt}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid},
+                        Ptr{$elty}, Ref{BlasInt}, Ptr{BlasInt}, Ref{BlasInt},
+                        Ptr{BlasInt}),
+                    0, 1, 1, select,
+                    n, A, lda, A,
+                    lda, ws.α, ws.β,
+                    A, lda, A, lda,
+                    Ref{BlasInt}(), C_NULL, C_NULL, C_NULL,
+                    ws.work, -1, ws.iwork, -1,
+                    info)
+                chklapackerror(info[])
+                resize!(ws.work, BlasInt(real(ws.work[1])))
+                resize!(ws.iwork, ws.iwork[1])
+            end
+            return ws
+        end
+
+        GeneralizedOrdSchurWs(A::AbstractMatrix{$elty}) = resize!(
+            GeneralizedOrdSchurWs(Vector{$elty}(undef, 1), Vector{BlasInt}(undef, 1),
+                $elty[], $elty[]),
+            A)
+
+        function tgsen!(ws::GeneralizedOrdSchurWs, select::AbstractVector{BlasInt},
+                S::AbstractMatrix{$elty}, T::AbstractMatrix{$elty},
+                Q::AbstractMatrix{$elty}, Z::AbstractMatrix{$elty}; resize = true)
+            require_one_based_indexing(select, S, T, Q, Z)
+            chkstride1(select, S, T, Q, Z)
+            n = checksquare(S)
+            if checksquare(T) != n || checksquare(Q) != n || checksquare(Z) != n
+                throw(DimensionMismatch("S, T, Q and Z must all be of size ($n,$n)"))
+            end
+            if length(select) != n
+                throw(DimensionMismatch("length of select, $(length(select)), must be $n"))
+            end
+            nws = length(ws)
+            if n != nws
+                if resize
+                    resize!(ws, S; work = n > nws)
+                else
+                    throw(WorkspaceSizeError(nws, n))
+                end
+            end
+            info = Ref{BlasInt}()
+            ccall((@blasfunc($tgsen), liblapack), Cvoid,
+                (Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt}, Ptr{BlasInt},
+                    Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{$elty},
+                    Ref{BlasInt}, Ptr{$elty}, Ptr{$elty},
+                    Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt},
+                    Ref{BlasInt}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid},
+                    Ptr{$elty}, Ref{BlasInt}, Ptr{BlasInt}, Ref{BlasInt},
+                    Ptr{BlasInt}),
+                0, 1, 1, select,
+                n, S, max(1, stride(S, 2)), T,
+                max(1, stride(T, 2)), ws.α, ws.β,
+                Q, max(1, stride(Q, 2)), Z, max(1, stride(Z, 2)),
+                Ref{BlasInt}(), C_NULL, C_NULL, C_NULL,
+                ws.work, length(ws.work), ws.iwork, length(ws.iwork),
+                info)
+            chklapackerror(info[])
+            return S, T, ws.α, ws.β, Q, Z
+        end
+    end
+end
+
+"""
+    tgsen!(ws, select, S, T, Q, Z; resize=true) -> (S, T, ws.α, ws.β, Q, Z)
+
+Reorders the generalized Schur decomposition `(S, T, Q, Z)` of a matrix pair, so that the
+eigenvalues selected by `select` (a vector of `0`s and `1`s) move to the top left corner,
+using the preallocated [`GeneralizedOrdSchurWs`](@ref) workspace `ws`.
+If `ws` is not of the right size, and `resize==true` it will be resized appropriately.
+`S`, `T`, `Q` and `Z` are overwritten, and the reordered generalized eigenvalues are `ws.α ./ ws.β`.
+This is the same as `LinearAlgebra.LAPACK.tgsen!(select, S, T, Q, Z)`, but without allocations.
+"""
+tgsen!(ws::GeneralizedOrdSchurWs, select::AbstractVector{BlasInt}, S::AbstractMatrix,
+    T::AbstractMatrix, Q::AbstractMatrix, Z::AbstractMatrix; kwargs...)
+
+"""
+    GeneralizedEigenvectorsWs
+
+Workspace to compute eigenvectors of a matrix pair in generalized Schur form `(S, P)`,
+using the [`tgevc!`](@ref) function. Supports `Complex` matrices.
+
+# Examples
+```julia
+julia> A, B = randn(ComplexF64, 4, 4), randn(ComplexF64, 4, 4);
+
+julia> F = schur(A, B);
+
+julia> ws = GeneralizedEigenvectorsWs(F.S);
+
+julia> VL, VR = similar(F.S, 0, 4), copy(F.Z);  # back-transform with Z: eigenvectors of (A, B)
+
+julia> _, VR, m = FastLapackInterface.tgevc!(ws, 'R', 'B', LinearAlgebra.BlasInt[], F.S, F.T, VL, VR);
+```
+"""
+mutable struct GeneralizedEigenvectorsWs{T <: Complex, RT <: AbstractFloat} <: Workspace
+    work::Vector{T}
+    rwork::Vector{RT}
+end
+
+Base.length(ws::GeneralizedEigenvectorsWs) = length(ws.work) ÷ 2
+
+for (tgevc, elty, relty) in ((:ztgevc_, :ComplexF64, :Float64),
+    (:ctgevc_, :ComplexF32, :Float32))
+    @eval begin
+        function Base.resize!(ws::GeneralizedEigenvectorsWs, A::AbstractMatrix{$elty})
+            n = checksquare(A)
+            resize!(ws.work, 2n)
+            resize!(ws.rwork, 2n)
+            return ws
+        end
+
+        GeneralizedEigenvectorsWs(A::AbstractMatrix{$elty}) =
+            resize!(GeneralizedEigenvectorsWs($elty[], $relty[]), A)
+
+        function tgevc!(ws::GeneralizedEigenvectorsWs, side::AbstractChar,
+                howmny::AbstractChar, select::AbstractVector{BlasInt},
+                S::AbstractMatrix{$elty}, P::AbstractMatrix{$elty},
+                VL::AbstractMatrix{$elty}, VR::AbstractMatrix{$elty}; resize = true)
+            require_one_based_indexing(select, S, P, VL, VR)
+            chkstride1(select, S, P, VL, VR)
+            side in ('L', 'R', 'B') ||
+                throw(ArgumentError("side must be 'L', 'R' or 'B', got '$side'"))
+            howmny in ('A', 'B', 'S') ||
+                throw(ArgumentError("howmny must be 'A', 'B' or 'S', got '$howmny'"))
+            n = checksquare(S)
+            if checksquare(P) != n
+                throw(DimensionMismatch("dimensions of S, ($n,$n), and P, $(size(P)), must match"))
+            end
+            if howmny == 'S' && length(select) != n
+                throw(DimensionMismatch("length of select, $(length(select)), must be $n"))
+            end
+            nws = length(ws)
+            if n != nws
+                if resize
+                    resize!(ws, S)
+                else
+                    throw(WorkspaceSizeError(nws, n))
+                end
+            end
+            mm = side == 'L' ? size(VL, 2) : side == 'R' ? size(VR, 2) :
+                 min(size(VL, 2), size(VR, 2))
+            m = Ref{BlasInt}()
+            info = Ref{BlasInt}()
+            ccall((@blasfunc($tgevc), liblapack), Cvoid,
+                (Ref{UInt8}, Ref{UInt8}, Ptr{BlasInt}, Ref{BlasInt},
+                    Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt},
+                    Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt},
+                    Ref{BlasInt}, Ptr{BlasInt}, Ptr{$elty}, Ptr{$relty}, Ptr{BlasInt},
+                    Clong, Clong),
+                side, howmny, select, n,
+                S, max(1, stride(S, 2)), P, max(1, stride(P, 2)),
+                VL, max(1, stride(VL, 2)), VR, max(1, stride(VR, 2)),
+                mm, m, ws.work, ws.rwork, info,
+                1, 1)
+            chklapackerror(info[])
+            return VL, VR, m[]
+        end
+    end
+end
+
+"""
+    tgevc!(ws, side, howmny, select, S, P, VL, VR; resize=true) -> (VL, VR, m)
+
+Computes some or all of the right (`side = 'R'`), left (`side = 'L'`) or both (`side = 'B'`)
+eigenvectors of a matrix pair `(S, P)` in generalized Schur form (upper triangular),
+using the preallocated [`GeneralizedEigenvectorsWs`](@ref) workspace `ws`.
+If `ws` is not of the right size, and `resize==true` it will be resized appropriately.
+
+- `howmny = 'A'`: compute all eigenvectors.
+- `howmny = 'B'`: compute all eigenvectors, back-transformed by the matrices passed in `VL`
+  and `VR` (e.g. `Q` and `Z` from a generalized Schur decomposition).
+- `howmny = 'S'`: compute only the eigenvectors selected by `select` (a vector of `0`s and `1`s).
+  `select` is ignored otherwise.
+
+`VL` and `VR` are overwritten with the eigenvectors, in their first `m` columns, and returned
+without resizing, so they may be views. Wraps LAPACK's `ztgevc`/`ctgevc`, which `LinearAlgebra.LAPACK` does not.
+"""
+tgevc!(ws::GeneralizedEigenvectorsWs, side::AbstractChar, howmny::AbstractChar,
+    select::AbstractVector{BlasInt}, S::AbstractMatrix, P::AbstractMatrix,
+    VL::AbstractMatrix, VR::AbstractMatrix; kwargs...)

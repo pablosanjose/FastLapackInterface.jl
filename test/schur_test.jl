@@ -170,3 +170,124 @@ end
         @test count(abs.(ws.eigen_values) .>= CRITERIUM) == ws.sdim[]
     end
 end
+
+@testset "GeneralizedSchurWs, Complex" begin
+    n = 10
+    for T in (ComplexF64, ComplexF32)
+        A0 = randn(T, n, n)
+        B0 = randn(T, n, n)
+        ws = GeneralizedSchurWs(copy(A0))
+
+        A1, B1, α1, β1, vsl1, vsr1 = LAPACK.gges!('V', 'V', copy(A0), copy(B0))
+        A2, B2, α2, β2, vsl2, vsr2 = LAPACK.gges!(ws, 'V', 'V', copy(A0), copy(B0))
+        @test isapprox(A1, A2)
+        @test isapprox(B1, B2)
+        @test isapprox(α1, α2)
+        @test isapprox(β1, β2)
+        @test isapprox(vsl1, vsl2)
+        @test isapprox(vsr1, vsr2)
+        @test isapprox(α1 ./ β1, ws.eigen_values)
+
+        # Using Workspace, factorize!
+        ws = Workspace(LAPACK.gges!, copy(A0))
+        A2, B2, α2, β2, vsl2, vsr2 = factorize!(ws, 'V', 'V', copy(A0), copy(B0))
+        @test isapprox(A1, A2)
+        @test isapprox(vsr1, vsr2)
+        show(devnull, "text/plain", ws)
+
+        @test_throws ArgumentError LAPACK.gges!(ws, 'V', 'V', copy(A0), copy(B0);
+            select = FastLapackInterface.lp)
+        for div in (-1, 1)
+            @test_throws FastLapackInterface.WorkspaceSizeError factorize!(
+                ws, 'V', 'V', randn(T, n + div, n + div),
+                randn(T, n + div, n + div); resize = false)
+            factorize!(ws, 'V', 'V', randn(T, n + div, n + div), randn(T, n + div, n + div))
+            @test length(ws.αr) == n + div
+        end
+    end
+end
+
+@testset "GeneralizedOrdSchurWs" begin
+    n = 10
+    for T in (ComplexF64, ComplexF32)
+        F = schur(randn(T, n, n), randn(T, n, n))
+        select = LinearAlgebra.BlasInt[isodd(i) for i in 1:n]
+        ws = GeneralizedOrdSchurWs(copy(F.S))
+
+        S1, T1, α1, β1, Q1, Z1 = LAPACK.tgsen!(select, copy(F.S), copy(F.T), copy(F.Q), copy(F.Z))
+        S2, T2, α2, β2, Q2, Z2 = LAPACK.tgsen!(ws, select, copy(F.S), copy(F.T), copy(F.Q), copy(F.Z))
+        @test isapprox(S1, S2)
+        @test isapprox(T1, T2)
+        @test isapprox(α1, α2)
+        @test isapprox(β1, β2)
+        @test isapprox(Q1, Q2)
+        @test isapprox(Z1, Z2)
+
+        # Using Workspace, decompose!
+        ws = Workspace(LAPACK.tgsen!, copy(F.S))
+        S2, T2, α2, β2, Q2, Z2 = decompose!(ws, select, copy(F.S), copy(F.T), copy(F.Q), copy(F.Z))
+        @test isapprox(S1, S2)
+        @test isapprox(Z1, Z2)
+        show(devnull, "text/plain", ws)
+
+        for div in (-1, 1)
+            F´ = schur(randn(T, n + div, n + div), randn(T, n + div, n + div))
+            select´ = LinearAlgebra.BlasInt[isodd(i) for i in 1:(n + div)]
+            @test_throws FastLapackInterface.WorkspaceSizeError decompose!(
+                ws, select´, F´.S, F´.T, F´.Q, F´.Z; resize = false)
+            decompose!(ws, select´, F´.S, F´.T, F´.Q, F´.Z)
+            @test length(ws.α) == n + div
+        end
+    end
+end
+
+@testset "GeneralizedEigenvectorsWs" begin
+    n = 10
+    for T in (ComplexF64, ComplexF32)
+        A0 = randn(T, n, n)
+        B0 = randn(T, n, n)
+        F = schur(A0, B0)
+        λs = F.α ./ F.β
+        ws = GeneralizedEigenvectorsWs(copy(F.S))
+        tol = sqrt(eps(real(T)))
+
+        # back-transformed right and left eigenvectors of (A0, B0)
+        VL, VR, m = FastLapackInterface.tgevc!(ws, 'B', 'B', LinearAlgebra.BlasInt[],
+            F.S, F.T, copy(F.Q), copy(F.Z))
+        @test m == n
+        for j in 1:n
+            v, u = VR[:, j], VL[:, j]
+            @test norm(A0 * v - λs[j] * B0 * v) < tol * norm(A0) * norm(v)
+            @test norm(u' * A0 - λs[j] * u' * B0) < tol * norm(A0) * norm(u)
+        end
+
+        # selected right eigenvectors of (S, T), written into a view
+        select = LinearAlgebra.BlasInt[i <= n ÷ 2 for i in 1:n]
+        VRall = FastLapackInterface.tgevc!(ws, 'R', 'A', select, F.S, F.T,
+            similar(F.S, 0, n), similar(F.S))[2]
+        VRsel = zeros(T, n, n)
+        _, _, m = FastLapackInterface.tgevc!(ws, 'R', 'S', select, F.S, F.T,
+            similar(F.S, 0, n), view(VRsel, :, 1:(n ÷ 2)))
+        @test m == n ÷ 2
+        @test isapprox(VRsel[:, 1:(n ÷ 2)], VRall[:, 1:(n ÷ 2)])
+        @test iszero(VRsel[:, (n ÷ 2 + 1):n])
+
+        # Using Workspace, decompose!
+        ws = Workspace(FastLapackInterface.tgevc!, copy(F.S))
+        _, VR2, _ = decompose!(ws, 'R', 'A', select, F.S, F.T, similar(F.S, 0, n), similar(F.S))
+        @test isapprox(VRall, VR2)
+        show(devnull, "text/plain", ws)
+
+        @test_throws ArgumentError FastLapackInterface.tgevc!(ws, 'X', 'A', select,
+            F.S, F.T, similar(F.S, 0, n), similar(F.S))
+        for div in (-1, 1)
+            F´ = schur(randn(T, n + div, n + div), randn(T, n + div, n + div))
+            args´ = ('R', 'A', LinearAlgebra.BlasInt[], F´.S, F´.T,
+                similar(F´.S, 0, n + div), similar(F´.S))
+            @test_throws FastLapackInterface.WorkspaceSizeError decompose!(ws, args´...;
+                resize = false)
+            decompose!(ws, args´...)
+            @test length(ws) == n + div
+        end
+    end
+end
