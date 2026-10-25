@@ -543,11 +543,8 @@ for (ggev, elty, relty) in ((:dggev_, :Float64, :Float64),
             ldb = lda
             resize!(ws.αr, n)
             cmplx = eltype(A) <: Complex
-            if cmplx && work
-                resize!(ws.αi, 8n)
-            else
-                resize!(ws.αi, n)
-            end
+            # for complex matrices αi is used as rwork, which zggev/cggev require to be 8n long
+            resize!(ws.αi, cmplx ? 8n : n)
             resize!(ws.β, n)
 
             jobvl = lvecs ? 'V' : 'N'
@@ -612,7 +609,7 @@ for (ggev, elty, relty) in ((:dggev_, :Float64, :Float64),
             if nws != n
                 if resize
                     resize!(ws, A, lvecs = size(ws.vl, 1) > 0 || jobvl == 'V',
-                        rvecs = size(ws.vr, 1) > 0 || jobvl == 'V', work = n > nws)
+                        rvecs = size(ws.vr, 1) > 0 || jobvr == 'V', work = n > nws)
                 else
                     throw(WorkspaceSizeError(nws, n))
                 end
@@ -649,7 +646,7 @@ for (ggev, elty, relty) in ((:dggev_, :Float64, :Float64),
                     jobvl, jobvr, n, A,
                     lda, B, ldb, ws.αr,
                     ws.β, ws.vl, max(ldvl, 1), ws.vr,
-                    max(ldvl, 1), ws.work, length(ws.work), ws.αi,
+                    max(ldvr, 1), ws.work, length(ws.work), ws.αi,
                     info, 1, 1)
                 chklapackerror(info[])
                 return ws.αr, ws.β, ws.vl, ws.vr

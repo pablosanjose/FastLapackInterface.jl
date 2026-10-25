@@ -223,5 +223,20 @@ end
         @test isapprox(vl1, vl2)
         @test isapprox(vr1, vr2)
         show(devnull, "text/plain", ws)
+        # right eigenvectors only
+        ws = GeneralizedEigenWs(copy(A0); rvecs = true)
+        αr1, β1, _, vr1 = LAPACK.ggev!('N', 'V', copy(A0), copy(B0))
+        αr2, β2, _, vr2 = LAPACK.ggev!(ws, 'N', 'V', copy(A0), copy(B0))
+        @test isapprox(αr1, αr2)
+        @test isapprox(β1, β2)
+        @test isapprox(vr1, vr2)
+        # shrinking the workspace keeps rwork (αi) at the 8n length that zggev requires
+        ws = GeneralizedEigenWs(copy(A0))
+        A1, B1 = A0[1:n-1, 1:n-1], B0[1:n-1, 1:n-1]
+        αr1, β1 = LAPACK.ggev!('N', 'N', copy(A1), copy(B1))
+        αr2, β2 = LAPACK.ggev!(ws, 'N', 'N', copy(A1), copy(B1))
+        @test length(ws.αi) >= 8 * (n - 1)
+        @test isapprox(αr1, αr2)
+        @test isapprox(β1, β2)
     end
 end
